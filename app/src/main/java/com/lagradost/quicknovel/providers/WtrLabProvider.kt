@@ -1,14 +1,16 @@
 package com.lagradost.quicknovel.providers
 
+import android.net.Uri
 import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonProperty
-import com.lagradost.quicknovel.ChapterData
+import com.fasterxml.jackson.databind.JsonNode
 import com.lagradost.quicknovel.ErrorLoadingException
 import com.lagradost.quicknovel.HeadMainPageResponse
 import com.lagradost.quicknovel.LoadResponse
 import com.lagradost.quicknovel.MainAPI
 import com.lagradost.quicknovel.R
 import com.lagradost.quicknovel.SearchResponse
+import com.lagradost.quicknovel.ChapterData
 import com.lagradost.quicknovel.UserReview
 import com.lagradost.quicknovel.fixUrlNull
 import com.lagradost.quicknovel.network.WebViewResolver
@@ -18,6 +20,9 @@ import com.lagradost.quicknovel.newSearchResponse
 import com.lagradost.quicknovel.newStreamResponse
 import com.lagradost.quicknovel.setStatus
 import com.lagradost.quicknovel.util.AppUtils.parseJson
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.withLock
+import org.jsoup.Jsoup
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -32,6 +37,11 @@ class WtrLabProvider : MainAPI() {
     override val hasMainPage = true
     override val usesCloudFlareKiller = true
     override val hasReviews = true
+
+    // The AI translation endpoint is protected: going too fast trips 429s/protection.
+    // APIRepository only rate limits load(), so loadHtml() throttles itself below.
+    override val rateLimitTime = 1000L
+
     override val mainCategories = listOf(
         "All" to "all",
         "Ongoing" to "ongoing",
@@ -140,22 +150,21 @@ class WtrLabProvider : MainAPI() {
         }
     }
 
-
     private suspend fun getChapterRange(
         url: String,
-        chaptersJson: ResultJsonResponse.Root,
+        rawId: Long,
         start: Long,
         end: Long
     ): List<ChapterData> {
-        val chapterDataUrl =
-            "$mainUrl/api/chapters/${chaptersJson.props.pageProps.serie.serieData.rawId}?start=$start&end=$end"
-        val chaptersDataJson =
-            app.get(chapterDataUrl).text
+        val chapterDataUrl = "$mainUrl/api/chapters/$rawId?start=$start&end=$end"
+        val chaptersDataJson = app.get(chapterDataUrl).text
         val chaptersData = parseJson<ResultChaptersJsonResponse.Root>(chaptersDataJson)
         return chaptersData.chapters.map { chapter ->
             newChapterData(
                 "#${chapter.order} ${chapter.title}",
-                "${url.trimEnd('/')}/chapter-${chapter.order}"
+                // raw_id/chapter_id let loadHtml hit /api/reader/get directly,
+                // without re-fetching this page just for __NEXT_DATA__
+                "${url.trimEnd('/')}/chapter-${chapter.order}?raw_id=$rawId&chapter_id=${chapter.id}"
             ) {
                 dateOfRelease = chapter.updatedAt
             }
@@ -169,17 +178,21 @@ class WtrLabProvider : MainAPI() {
         val json = jsonNode?.data() ?: throw ErrorLoadingException("no chapters")
         val chaptersJson = parseJson<ResultJsonResponse.Root>(json)
 
+        val rawId = chaptersJson.props.pageProps.serie.serieData.rawId
+        val rawChapterCount = chaptersJson.props.pageProps.serie.serieData.rawChapterCount
+
+        // The chapters api returns at most 500 entries per call
         val chapters = mutableListOf<ChapterData>()
-        chapters.addAll(
-            getChapterRange(
-                url,
-                chaptersJson,
-                1,
-                chaptersJson.props.pageProps.serie.serieData.rawChapterCount
-            )
-        )
+        var start = 1L
+        while (start <= rawChapterCount) {
+            val end = minOf(start + CHAPTER_PAGE_SIZE - 1, rawChapterCount)
+            chapters.addAll(getChapterRange(url, rawId, start, end))
+            start += CHAPTER_PAGE_SIZE
+        }
+        val uniqueChapters = chapters.distinctBy { it.url }
+
         val id = chaptersJson.props.pageProps.serie.serieData.id.toString()
-        return newStreamResponse(title, url, chapters) {
+        return newStreamResponse(title, url, uniqueChapters) {
             synopsis = doc.selectFirst(".desc-wrap")?.text()
             posterUrl = fixUrlNull(doc.selectFirst(".image-wrap > img")?.attr("src"))
             val details = doc.select("div.detail-buttons div")
@@ -242,36 +255,223 @@ class WtrLabProvider : MainAPI() {
         } ?: emptyList()
     }
 
-    override suspend fun loadHtml(url: String): String? {
-        val urlWithService = if (url.contains("?")) "$url&service=web" else "$url?service=web"
-        try {
-            val doc = app.get(urlWithService).document
-            val jsonNode = doc.selectFirst("#__NEXT_DATA__")
-            val json = jsonNode?.data() ?: throw ErrorLoadingException("No se encontró JSON de capítulos")
-            val chaptersJson = parseJson<LoadJsonResponse.Root>(json)
-            val chapter = chaptersJson.props.pageProps.serie
+    // ======================== chapter content ========================
 
-        val root = app.post(
-            url = "$mainUrl/api/reader/get", data = mapOf(
-                "chapter_id" to chapter.chapter.id.toString(),
-                "chapter_no" to chapter.serieData.slug,
-                "force_retry" to "false",
-                "language" to "en",
-                "raw_id" to chapter.serieData.rawId.toString(),
-                "retry" to "false",
-                "translate" to "web",
-            )
-        ).parsed<LoadJsonResponse2.Root>()
+    /** Thrown when the pre-generated AI (english) translation is not there yet */
+    private class AiUnavailableException(message: String) : ErrorLoadingException(message)
 
-            val paragraphs = decryptContent(root.data.data.body)
-            val text = StringBuilder()
-            for (p in paragraphs) {
-                text.append("<p>")
-                text.append(p)
-                text.append("</p>")
+    private val chapterOrderRegex = Regex("""chapter-(\d+)""")
+
+    /** WTR marks glossed terms in the translated text as ※8⛬ style placeholders */
+    private val glossaryMarkerRegex = Regex("※(\\d+)(?:[⛬〓〰●•\\uFE0F]+)?")
+
+    private val encryptedTripleRegex = Regex("^[A-Za-z0-9+/_=-]+:[A-Za-z0-9+/_=-]+:[A-Za-z0-9+/_=-]+$")
+
+    private val aiLockedRegex = Regex(
+        """locked|unlock|ticket|pending|processing|translation.{0,30}(queue|pending)|not\s+translated|translation\s+not\s+available|translation\s+not\s+found""",
+        RegexOption.IGNORE_CASE
+    )
+
+    private val cjkRegex = Regex("[\\u3400-\\u4DBF\\u4E00-\\u9FFF]")
+    private val latinRegex = Regex("[A-Za-z\\u00C0-\\u024F]")
+
+    private fun escapeHtml(text: String): String = text
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+
+    /**
+     * The AI translation api occasionally returns the untranslated raw text.
+     * Detect that so chapters never silently get saved in Chinese.
+     */
+    private fun looksMostlyCJK(text: String): Boolean {
+        val s = text.replace(Regex("\\s+"), " ").trim()
+        if (s.isEmpty()) return false
+        val cjk = cjkRegex.findAll(s).count()
+        val latin = latinRegex.findAll(s).count()
+        val letters = cjk + latin
+        if (cjk < 20) return false
+        if (latin == 0) return true
+        return cjk.toDouble() / letters >= 0.35
+    }
+
+    private fun extractApiMessage(root: JsonNode): String {
+        val candidates = listOf(
+            root.path("message"),
+            root.path("error"),
+            root.path("error").path("message"),
+            root.path("data").path("message"),
+            root.path("data").path("error"),
+            root.path("data").path("data").path("message"),
+            root.path("data").path("data").path("error"),
+            root.path("reason"),
+            root.path("detail"),
+            root.path("status_message"),
+            root.path("data").path("status_message"),
+        )
+        return candidates.firstOrNull { node -> node != null && node.isTextual && node.asText().isNotBlank() }
+            ?.asText()?.take(300) ?: ""
+    }
+
+    private fun glossaryTerm(terms: JsonNode, idx: Int): String? {
+        if (!terms.isArray) return null
+        val entry = terms.get(idx) ?: return null
+        when {
+            entry.isTextual -> return entry.asText().trim()
+                .takeIf { it.isNotEmpty() && !it.contains("※") }
+
+            entry.isArray -> {
+                for (candidate in entry) {
+                    if (candidate.isTextual) {
+                        val text = candidate.asText().trim()
+                        if (text.isNotEmpty() && !text.contains("※")) return text
+                    }
+                }
             }
-            return text.toString()
+
+            entry.isObject -> {
+                for (key in listOf("term", "text", "translation", "name")) {
+                    val value = entry.path(key)
+                    if (value.isTextual) {
+                        return value.asText().trim().takeIf { it.isNotEmpty() }
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    private fun resolveGlossary(text: String, terms: JsonNode): String {
+        if (!terms.isArray || !text.contains('※')) return text
+        return glossaryMarkerRegex.replace(text) { match ->
+            val idx = match.groupValues.getOrNull(1)?.toIntOrNull()
+            (idx?.let { glossaryTerm(terms, it) } ?: match.value).take(2000)
+        }
+    }
+
+    private fun looksLikeEncryptedTriple(value: String): Boolean {
+        val s = value.trim()
+        return s.length >= 24 && !s.contains(Regex("\\s")) &&
+                encryptedTripleRegex.matches(s) &&
+                s.split(":").all { it.length >= 8 }
+    }
+
+    /**
+     * Fetches WTR's pre-generated AI translation from /api/reader/get.
+     * translate="ai" is the important part: "web" returns the raw Chinese body.
+     */
+    private suspend fun loadHtmlAi(url: String, order: Long): String {
+        val uri = Uri.parse(url)
+        var rawId = uri.getQueryParameter("raw_id")
+        var chapterId = uri.getQueryParameter("chapter_id")?.toLongOrNull()
+
+        // Fallback for deep links without the ids: pull them from the page json
+        if (rawId.isNullOrEmpty() || chapterId == null) {
+            val urlWithService = if (url.contains("?")) "$url&service=web" else "$url?service=web"
+            val doc = app.get(urlWithService).document
+            val nextData = doc.selectFirst("#__NEXT_DATA__")?.data()
+                ?: throw ErrorLoadingException("WTR-LAB page metadata not found")
+            val chapterPage = parseJson<LoadJsonResponse.Root>(nextData)
+            rawId = chapterPage.props.pageProps.serie.serieData.rawId.toString()
+            chapterId = chapterPage.props.pageProps.serie.chapter.id
+        }
+        val finalRawId = rawId ?: throw ErrorLoadingException("WTR-LAB raw id not found")
+
+        val payload = mutableMapOf<String, Any>(
+            "translate" to "ai",
+            "language" to "en",
+            "raw_id" to finalRawId,
+            "chapter_no" to order,
+            "retry" to false,
+            "force_retry" to false,
+        )
+        chapterId?.let { payload["chapter_id"] = it }
+
+        val responseText = app.post(
+            url = "$mainUrl/api/reader/get",
+            headers = mapOf("Accept" to "application/json", "Referer" to url),
+            json = payload
+        ).text
+
+        val root = parseJson<JsonNode>(responseText)
+        val data = root.path("data").path("data")
+        val bodyNode = data.path("body")
+        if (!bodyNode.isTextual || bodyNode.asText().isBlank()) {
+            val message = extractApiMessage(root)
+            when {
+                aiLockedRegex.containsMatchIn(responseText) ->
+                    throw AiUnavailableException(
+                        "Chapter $order: AI translation is locked/pending on WTR-LAB (${message.ifBlank { "locked" }})"
+                    )
+
+                message.isNotBlank() ->
+                    throw ErrorLoadingException("WTR-LAB: $message")
+
+                else ->
+                    throw AiUnavailableException("Chapter $order: AI translation is not available on WTR-LAB yet")
+            }
+        }
+
+        val rawBody = bodyNode.asText()
+        val terms = data.path("glossary_data").path("terms")
+        val images = data.path("images").takeIf { it.isArray }
+            ?.mapNotNull { img -> img.asText().takeIf { it.isNotBlank() } }
+            ?: emptyList()
+
+        val parts: List<String> =
+            if (rawBody.startsWith("arr:") || rawBody.startsWith("str:") || looksLikeEncryptedTriple(rawBody)) {
+                val decrypted = decryptContent(rawBody)
+                // arr mode is one entry per paragraph, str mode is one blob split by newlines
+                if (decrypted.size <= 1) decrypted.flatMap { it.split(Regex("\\r?\\n+")) }
+                else decrypted
+            } else {
+                rawBody.split(Regex("\\r?\\n+"))
+            }
+
+        val text = StringBuilder()
+        var imageIndex = 0
+        for (part in parts) {
+            val paragraph = part.trim()
+            if (paragraph.isEmpty()) continue
+            if (paragraph == "[image]") {
+                images.getOrNull(imageIndex++)?.let { img ->
+                    val src = if (img.startsWith("/")) mainUrl + img else img
+                    text.append("<img src=\"").append(src.replace("\"", "&quot;")).append("\"/>")
+                }
+                continue
+            }
+            // strip any leftover tags, then resolve ※N⛬ glossary placeholders
+            val plain = if (paragraph.contains('<')) Jsoup.parse(paragraph).text() else paragraph
+            val resolved = resolveGlossary(plain, terms).trim()
+            if (resolved.isNotEmpty()) {
+                text.append("<p>").append(escapeHtml(resolved)).append("</p>")
+            }
+        }
+
+        val result = text.toString()
+        if (result.isBlank()) throw AiUnavailableException("Chapter $order: AI translation returned an empty body")
+        if (looksMostlyCJK(result)) throw AiUnavailableException(
+            "Chapter $order: AI translation not available - WTR-LAB returned the raw Chinese text"
+        )
+        return result
+    }
+
+    override suspend fun loadHtml(url: String): String {
+        val order = chapterOrderRegex.find(url)?.groupValues?.get(1)?.toLongOrNull()
+            ?: throw ErrorLoadingException("WTR-LAB could not parse the chapter number from $url")
+
+        // downloads do not pass through the repository rate limiter, throttle here instead
+        rateLimitMutex.withLock { delay(rateLimitTime) }
+
+        try {
+            return loadHtmlAi(url, order)
+        } catch (e: AiUnavailableException) {
+            // fail closed: without an AI translation the site just shows the raw Chinese text
+            throw e
         } catch (e: Exception) {
+            // last resort: render the reader page in a WebView (site's own translation pipeline)
+            val urlWithService =
+                if (url.contains("?")) "$url&service=web" else "$url?service=web"
             val script = """
                              (function() {
                                  var checkInterval = setInterval(function() {
@@ -285,7 +485,14 @@ class WtrLabProvider : MainAPI() {
                                  setTimeout(function() { clearInterval(checkInterval); }, 30000);
                              })();
                          """.trimIndent()
-            return WebViewResolver(scriptToFinish = script, useOkhttp = false).resolveUsingWebView(urlWithService)
+            val html = WebViewResolver(scriptToFinish = script, useOkhttp = false)
+                .resolveUsingWebView(urlWithService)
+                ?: throw ErrorLoadingException("WTR-LAB: could not load chapter $order")
+
+            if (looksMostlyCJK(html)) throw ErrorLoadingException(
+                "Chapter $order: no AI translation on WTR-LAB yet (page is still in Chinese)"
+            )
+            return html
         }
     }
 
@@ -329,6 +536,10 @@ class WtrLabProvider : MainAPI() {
         } else {
             listOf(decryptedText)
         }
+    }
+
+    companion object {
+        private const val CHAPTER_PAGE_SIZE = 500L
     }
 
     data class RelatedResponse(
@@ -380,52 +591,19 @@ class WtrLabProvider : MainAPI() {
     object ResultJsonResponse {
         data class Root(
             val props: Props,
-            /*val page: String,
-            val query: Query,
-            val buildId: String,
-            val isFallback: Boolean,
-            val isExperimentalCompile: Boolean,
-            val gssp: Boolean,
-            val locale: String,
-            val locales: List<String>,
-            val defaultLocale: String,
-            val scriptLoader: List<Any?>,*/
         )
 
         data class Props(
             val pageProps: PageProps,
-            // @JsonProperty("__N_SSP")
-            /// val nSsp: Boolean,
         )
 
         data class PageProps(
             val serie: Serie,
-            /*val tags: List<Tag>,
-            @JsonProperty("server_time")
-            val serverTime: String,
-            @JsonProperty("disabe_ads")
-            val disabeAds: Boolean,
-            @JsonProperty("_sentryTraceData")
-            val sentryTraceData: String,
-            @JsonProperty("_sentryBaggage")
-            val sentryBaggage: String,*/
         )
 
         data class Serie(
             @JsonProperty("serie_data")
             val serieData: SerieData,
-            /*val ranks: Ranks,
-            val recommendation: List<Recommendation>,
-            val raws: List<Raw3>,
-            val names: List<Name>,
-            @JsonProperty("other_series")
-            val otherSeries: List<Series>,
-            @JsonProperty("last_chapters")
-            val lastChapters: List<LastChapter>,*/
-            /*@JsonProperty("raw_rank")
-            val rawRank: Any?,
-            @JsonProperty("released_user")
-            val releasedUser: Any?,*/
         )
 
         data class SerieData(
@@ -433,347 +611,39 @@ class WtrLabProvider : MainAPI() {
             val rawId: Long,
             @JsonProperty("id")
             val id: Long,
-            /*
-            @JsonProperty("search_text")
-            val searchText: String,
-            val status: Long,
-            val data: Data,
-            @JsonProperty("created_at")
-            val createdAt: String,
-            @JsonProperty("updated_at")
-            val updatedAt: String,
-            val view: Long,
-            @JsonProperty("in_library")
-            val inLibrary: Long,
-            val rating: Any?,
-            @JsonProperty("chapter_count")
-            val chapterCount: Long,
-            val power: Long,
-            @JsonProperty("total_rate")
-            val totalRate: Long,
-            @JsonProperty("user_status")
-            val userStatus: Long,
-            val verified: Boolean,
-            val from: String,
-            val author: String,
-            @JsonProperty("ai_enabled")
-            val aiEnabled: Boolean,
-            @JsonProperty("released_by")
-            val releasedBy: Any?,
-            @JsonProperty("raw_status")
-            val rawStatus: Long,*/
             @JsonProperty("raw_chapter_count")
             val rawChapterCount: Long,
-            /*
-            val genres: List<Long>,
-            @JsonProperty("raw_verified")
-            val rawVerified: Boolean,
-            @JsonProperty("requested_by")
-            val requestedBy: String,
-            @JsonProperty("requested_by_name")
-            val requestedByName: String,
-            @JsonProperty("requested_member")
-            val requestedMember: String,
-            @JsonProperty("requested_role")
-            val requestedRole: Long,*/
-        )
-
-        /*data class Ranks(
-            val week: Any?,
-            val month: Any?,
-            val all: String,
-        )
-
-        data class Recommendation(
-            @JsonProperty("serie_id")
-            val serieId: Long,
-            @JsonProperty("recommendation_id")
-            val recommendationId: Long,
-            val score: Long,
-            val id: Long,
-            val slug: String,
-            @JsonProperty("search_text")
-            val searchText: String,
-            val status: Long,
-            val data: Data2,
-            @JsonProperty("created_at")
-            val createdAt: String,
-            @JsonProperty("updated_at")
-            val updatedAt: String,
-            val view: Long,
-            @JsonProperty("in_library")
-            val inLibrary: Long,
-            val rating: Double?,
-            @JsonProperty("chapter_count")
-            val chapterCount: Long,
-            val power: Long,
-            @JsonProperty("total_rate")
-            val totalRate: Long,
-            @JsonProperty("user_status")
-            val userStatus: Long,
-            val verified: Boolean,
-            val from: String?,
-            val author: String,
-            @JsonProperty("raw_id")
-            val rawId: Long,
-            @JsonProperty("ai_enabled")
-            val aiEnabled: Boolean,
-        )
-
-        data class Data2(
-            val title: String,
-            val author: String,
-            val description: String,
-            @JsonProperty("from_user")
-            val fromUser: String?,
-            val raw: Raw2,
-            val image: String,
-        )
-
-        data class Raw2(
-            val title: String,
-            val author: String,
-            val description: String,
-        )
-
-        data class Raw3(
-            val id: Long,
-            @JsonProperty("chapter_count")
-            val chapterCount: Long,
-            val view: Long,
-            val slug: String,
-            @JsonProperty("created_at")
-            val createdAt: String,
-            val default: Boolean,
-            val verified: Boolean,
-        )
-
-        data class Name(
-            val title: String,
-            @JsonProperty("raw_title")
-            val rawTitle: String,
-        )
-
-        data class Series(
-            val id: Long,
-            val slug: String,
-            @JsonProperty("search_text")
-            val searchText: String,
-            val status: Long,
-            val data: Data3,
-            @JsonProperty("created_at")
-            val createdAt: String,
-            @JsonProperty("updated_at")
-            val updatedAt: String,
-            val view: Long,
-            @JsonProperty("in_library")
-            val inLibrary: Long,
-            val rating: Double,
-            @JsonProperty("chapter_count")
-            val chapterCount: Long,
-            val power: Long,
-            @JsonProperty("total_rate")
-            val totalRate: Long,
-            @JsonProperty("user_status")
-            val userStatus: Long,
-            val verified: Boolean,
-            val from: String,
-            val author: String,
-            @JsonProperty("raw_id")
-            val rawId: Long,
-        )
-
-        data class Data3(
-            val title: String,
-            val author: String,
-            val description: String,
-            @JsonProperty("from_user")
-            val fromUser: String,
-            val raw: Raw4,
-            val image: String,
-        )
-
-        data class Raw4(
-            val title: String,
-            val author: String,
-            val description: String,
-        )
-
-        data class LastChapter(
-            //@JsonProperty("serie_id")
-            //val serieId: Long,
-            //val id: Long,
-            val order: Long,
-            val title: String,
-            //val name: String,
-            @JsonProperty("updated_at")
-            val updatedAt: String?,
-        )
-
-        data class Tag(
-            val id: Long,
-            val title: String,
-            val slug: String,
-        )
-
-        data class Query(
-            val sid: String,
-            @JsonProperty("serie_slug")
-            val serieSlug: String,
-        )*/
-    }
-
-    object LoadJsonResponse2 {
-
-        data class Root(
-            // val success: Boolean,
-            // val chapter: Chapter,
-            val data: Data,
-        )
-
-        data class Chapter(
-            val id: Long,
-            @JsonProperty("raw_id")
-            val rawId: Long,
-            val order: Long,
-            val title: String,
-        )
-
-        data class Data(
-            /*@JsonProperty("raw_id")
-            val rawId: Long,
-            @JsonProperty("chapter_id")
-            val chapterId: Long,
-            val status: Long,
-            */
-            val data: Data2,
-            /*@JsonProperty("created_at")
-            val createdAt: String,
-            val language: String,*/
-        )
-
-        data class Data2(
-            val body: String = "",
-            /*val hans: String,
-            val hash: String,
-            val model: String,
-            val patch: Any?,
-            val title: String,
-            val prompt: String,
-            @JsonProperty("glossory_hash")
-            val glossoryHash: String,
-            @JsonProperty("glossary_build")
-            val glossaryBuild: Long,*/
         )
     }
 
+    /** only used by the fallback that reads the chapter page's __NEXT_DATA__ */
     object LoadJsonResponse {
         data class Root(
             val props: Props,
-            val page: String,
-            val query: Query,
-            val buildId: String,
-            val isFallback: Boolean,
-            val isExperimentalCompile: Boolean,
-            val gssp: Boolean,
-            /*
-                    val locale: String,
-                    val locales: List<String>,
-                    val defaultLocale: String,
-                    val scriptLoader: List<Any?>,*/
         )
 
         data class Props(
             val pageProps: PageProps,
-            /*@JsonProperty("__N_SSP")
-            val nSsp: Boolean,
-            */
         )
 
         data class PageProps(
             val serie: Serie,
-            /*@JsonProperty("disabe_ads")
-            val disabeAds: Boolean,
-            @JsonProperty("server_time")
-            val serverTime: String,
-            @JsonProperty("active_service")
-            val activeService: ActiveService,
-            @JsonProperty("_sentryTraceData")
-            val sentryTraceData: String,
-            @JsonProperty("_sentryBaggage")
-            val sentryBaggage: String,*/
         )
 
         data class Chapter(
             val id: Long,
-            val slug: String?,
-            @JsonProperty("raw_id")
-            val rawId: Long,
-            /*@JsonProperty("serie_id")
-            val serieId: Long,
-            val status: Long,
-            val slug: String,
-            val name: String,
-            val order: Long,
-            @JsonProperty("is_update")
-            val isUpdate: Boolean,
-            @JsonProperty("created_at")
-            val createdAt: String,
-            @JsonProperty("updated_at")
-            val updatedAt: String,
-            val title: String,
-            val code: String,*/
         )
 
         data class Serie(
             @JsonProperty("serie_data")
             val serieData: SerieData,
-            /*
-            @JsonProperty("default_service")
-            val defaultService: String,*/
             val chapter: Chapter,
         )
 
         data class SerieData(
             val id: Long,
-            val slug: String,
-            val data: Data,
             @JsonProperty("raw_id")
             val rawId: Long,
-            @JsonProperty("user_status")
-            val userStatus: Long,
-            @JsonProperty("is_default")
-            val isDefault: Boolean,
-            @JsonProperty("chapter_count")
-            val chapterCount: Long,
-            @JsonProperty("ai_enabled")
-            val aiEnabled: Boolean,
-            @JsonProperty("raw_status")
-            val rawStatus: Long,
-        )
-
-        data class Data(
-            val title: String,
-            val author: String,
-            val description: String,
-            @JsonProperty("from_user")
-            val fromUser: String?,
-            val raw: Raw,
-            val image: String,
-        )
-
-        data class Raw(
-            val title: String,
-            val author: String,
-            val description: String,
-        )
-
-        data class Query(
-            val locale: String,
-            @JsonProperty("serie_slug")
-            val serieSlug: String,
-            @JsonProperty("chapter_no")
-            val chapterNo: String,
         )
     }
 }
